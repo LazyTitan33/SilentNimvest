@@ -1,5 +1,5 @@
 # SilentNimvest
-Basically, SilentNimvest is a SAM and Security Hives parser written in Nim. SilentNimvest reads keys under these hives by using the SilentHarvest technique. With this technique, rather than a SYSTEM-level privilege, a plain Administrator account who enables `SeBackupPrivilege` (thanks to `NtOpenKeyEx` flags) can dump the Local users' hashes, cached domain logon information, LSA Secrets, and other secrets that can be obtained from these hives
+Basically, SilentNimvest is a SAM and Security Hives parser written in Nim. SilentNimvest reads keys under these hives by using the Silent Harvest technique. With this technique, rather than a SYSTEM-level privilege, a plain Administrator account who enables `SeBackupPrivilege` (thanks to `NtOpenKeyEx` flags) can dump the Local users' hashes, cached domain logon information, LSA Secrets, and other secrets that can be obtained from these hives
 by using a less EDR-alerted registry read API which is `RegQueryMultipleValuesW`.
 The whole project is based on [sud0ru's research](https://sud0ru.ghost.io/silent-harvest-extracting-windows-secrets-under-the-radar/).
 
