@@ -48,3 +48,7 @@ _\ \ | |  __/ | | | |_/ /\  /| | | | | | \ V /  __/\__ \ |_
 - https://sud0ru.ghost.io/silent-harvest-extracting-windows-secrets-under-the-radar/
 - https://github.com/GhostPack/SharpDump
 - https://cocomelonc.github.io/malware/2024/06/01/malware-cryptography-28.html
+
+# Disclaimer
+
+For authorized security testing only. Misuse of this tool against systems without explicit permission is illegal.
