@@ -8,7 +8,7 @@ The whole project is based on [sud0ru's research](https://sud0ru.ghost.io/silent
 You can directly compile the source code with the following command:
 
 ```bash
-sudo apt install mingw-w64
+sudo apt install mingw-w64 nim
 nimble install winim nimcrypto checksums des
 
 nim c -d:release -d:mingw -o:SilentNimvest.exe Main.nim
